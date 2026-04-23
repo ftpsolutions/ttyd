@@ -3,12 +3,18 @@ import { h, Component } from 'preact';
 import { Terminal } from './terminal';
 
 import type { ITerminalOptions, ITheme } from '@xterm/xterm';
-import type { ClientOptions, FlowControl } from './terminal/xterm';
+import type { ClientOptions, Endpoints, FlowControl } from './terminal/xterm';
 
-const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-const path = window.location.pathname.replace(/[/]+$/, '');
-const wsUrl = [protocol, '//', window.location.host, path, '/ws', window.location.search].join('');
-const tokenUrl = [window.location.protocol, '//', window.location.host, path, '/token'].join('');
+const base = [window.location.protocol, '//', window.location.host, window.location.pathname.replace(/[/]+$/, '')].join(
+    ''
+);
+const endpoints: Endpoints = {
+    session: `${base}/session`,
+    poll: `${base}/poll`,
+    input: `${base}/input`,
+    close: `${base}/close`,
+};
+const tokenUrl = `${base}/token`;
 const clientOptions = {
     rendererType: 'webgl',
     disableLeaveAlert: false,
@@ -57,7 +63,7 @@ export class App extends Component {
         return (
             <Terminal
                 id="terminal-container"
-                wsUrl={wsUrl}
+                endpoints={endpoints}
                 tokenUrl={tokenUrl}
                 clientOptions={clientOptions}
                 termOptions={termOptions}

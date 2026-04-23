@@ -59,8 +59,15 @@ export interface FlowControl {
     lowWater: number;
 }
 
+export interface Endpoints {
+    session: string;
+    poll: string;
+    input: string;
+    close: string;
+}
+
 export interface XtermOptions {
-    wsUrl: string;
+    endpoints: Endpoints;
     tokenUrl: string;
     flowControl: FlowControl;
     clientOptions: ClientOptions;
@@ -92,7 +99,9 @@ export class Xterm {
     private canvasAddon?: CanvasAddon;
     private zmodemAddon?: ZmodemAddon;
 
-    private socket?: WebSocket;
+    private sid?: string;
+    private connected = false;
+    private pollAbort?: AbortController;
     private token: string;
     private opened = false;
     private title?: string;
@@ -101,6 +110,7 @@ export class Xterm {
     private reconnect = true;
     private doReconnect = true;
     private closeOnDisconnect = false;
+    private listenersAttached = false;
 
     private writeFunc = (data: ArrayBuffer) => this.writeData(new Uint8Array(data));
 
@@ -114,6 +124,7 @@ export class Xterm {
             d.dispose();
         }
         this.disposables.length = 0;
+        this.listenersAttached = false;
     }
 
     @bind
@@ -143,12 +154,25 @@ export class Xterm {
     @bind
     private onWindowUnload(event: BeforeUnloadEvent) {
         event.preventDefault();
-        if (this.socket?.readyState === WebSocket.OPEN) {
+        if (this.connected) {
             const message = 'Close terminal? this will also terminate the command.';
             event.returnValue = message;
+            // Best-effort session close using sendBeacon so the pty is reaped
+            // immediately instead of waiting for the idle timer.
+            if (this.sid) {
+                try {
+                    navigator.sendBeacon(this.closeUrl(this.sid));
+                } catch {
+                    // ignore
+                }
+            }
             return message;
         }
         return undefined;
+    }
+
+    private closeUrl(sid: string): string {
+        return `${this.options.endpoints.close}?sid=${encodeURIComponent(sid)}`;
     }
 
     @bind
@@ -171,7 +195,10 @@ export class Xterm {
 
     @bind
     private initListeners() {
-        const { terminal, fitAddon, overlayAddon, register, sendData } = this;
+        if (this.listenersAttached) return;
+        this.listenersAttached = true;
+
+        const { terminal, fitAddon, overlayAddon, register, sendData, sendBinary } = this;
         register(
             terminal.onTitleChange(data => {
                 if (data && data !== '' && !this.titleFixed) {
@@ -184,7 +211,10 @@ export class Xterm {
         register(
             terminal.onResize(({ cols, rows }) => {
                 const msg = JSON.stringify({ columns: cols, rows: rows });
-                this.socket?.send(this.textEncoder.encode(Command.RESIZE_TERMINAL + msg));
+                const payload = new Uint8Array(msg.length + 1);
+                payload[0] = Command.RESIZE_TERMINAL.charCodeAt(0);
+                this.textEncoder.encodeInto(msg, payload.subarray(1));
+                sendBinary(payload);
                 if (this.resizeOverlay) overlayAddon.showOverlay(`${cols}x${rows}`, 300);
             })
         );
@@ -196,7 +226,7 @@ export class Xterm {
                 } catch (e) {
                     return;
                 }
-                this.overlayAddon?.showOverlay('\u2702', 200);
+                this.overlayAddon?.showOverlay('✂', 200);
             })
         );
         register(addEventListener(window, 'resize', () => fitAddon.fit()));
@@ -205,7 +235,7 @@ export class Xterm {
 
     @bind
     public writeData(data: string | Uint8Array) {
-        const { terminal, textEncoder } = this;
+        const { terminal } = this;
         const { limit, highWater, lowWater } = this.options.flowControl;
 
         this.written += data.length;
@@ -213,13 +243,13 @@ export class Xterm {
             terminal.write(data, () => {
                 this.pending = Math.max(this.pending - 1, 0);
                 if (this.pending < lowWater) {
-                    this.socket?.send(textEncoder.encode(Command.RESUME));
+                    this.sendBinary(this.textEncoder.encode(Command.RESUME));
                 }
             });
             this.pending++;
             this.written = 0;
             if (this.pending > highWater) {
-                this.socket?.send(textEncoder.encode(Command.PAUSE));
+                this.sendBinary(this.textEncoder.encode(Command.PAUSE));
             }
         } else {
             terminal.write(data);
@@ -228,71 +258,180 @@ export class Xterm {
 
     @bind
     public sendData(data: string | Uint8Array) {
-        const { socket, textEncoder } = this;
-        if (socket?.readyState !== WebSocket.OPEN) return;
+        if (!this.connected) return;
 
         if (typeof data === 'string') {
             const payload = new Uint8Array(data.length * 3 + 1);
             payload[0] = Command.INPUT.charCodeAt(0);
-            const stats = textEncoder.encodeInto(data, payload.subarray(1));
-            socket.send(payload.subarray(0, (stats.written as number) + 1));
+            const stats = this.textEncoder.encodeInto(data, payload.subarray(1));
+            this.sendBinary(payload.subarray(0, (stats.written as number) + 1));
         } else {
             const payload = new Uint8Array(data.length + 1);
             payload[0] = Command.INPUT.charCodeAt(0);
             payload.set(data, 1);
-            socket.send(payload);
+            this.sendBinary(payload);
         }
     }
 
     @bind
-    public connect() {
-        this.socket = new WebSocket(this.options.wsUrl, ['tty']);
-        const { socket, register } = this;
-
-        socket.binaryType = 'arraybuffer';
-        register(addEventListener(socket, 'open', this.onSocketOpen));
-        register(addEventListener(socket, 'message', this.onSocketData as EventListener));
-        register(addEventListener(socket, 'close', this.onSocketClose as EventListener));
-        register(addEventListener(socket, 'error', () => (this.doReconnect = false)));
+    private sendBinary(payload: Uint8Array) {
+        if (!this.sid) return;
+        // Fire-and-forget POST /input. We don't await so keystrokes pipeline.
+        fetch(`${this.options.endpoints.input}?sid=${encodeURIComponent(this.sid)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: payload,
+            keepalive: true,
+        }).catch(err => {
+            console.warn('[ttyd] input POST failed:', err);
+        });
     }
 
     @bind
-    private onSocketOpen() {
-        console.log('[ttyd] websocket connection opened');
-
-        const { textEncoder, terminal, overlayAddon } = this;
+    public async connect() {
+        const { terminal } = this;
         const msg = JSON.stringify({ AuthToken: this.token, columns: terminal.cols, rows: terminal.rows });
-        this.socket?.send(textEncoder.encode(msg));
+
+        try {
+            const resp = await fetch(this.options.endpoints.session + window.location.search, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: msg,
+            });
+            if (!resp.ok) {
+                console.error(`[ttyd] session create failed: ${resp.status}`);
+                this.handleDisconnect(resp.status === 401 ? 1000 : 1006);
+                return;
+            }
+            const json = await resp.json();
+            this.sid = json.sid;
+        } catch (e) {
+            console.error('[ttyd] session create error:', e);
+            this.handleDisconnect(1006);
+            return;
+        }
+
+        console.log(`[ttyd] session opened: ${this.sid}`);
+        this.connected = true;
+        this.doReconnect = this.reconnect;
 
         if (this.opened) {
             terminal.reset();
             terminal.options.disableStdin = false;
-            overlayAddon.showOverlay('Reconnected', 300);
+            this.overlayAddon.showOverlay('Reconnected', 300);
         } else {
             this.opened = true;
         }
 
-        this.doReconnect = this.reconnect;
         this.initListeners();
         terminal.focus();
+        this.pollLoop();
     }
 
     @bind
-    private onSocketClose(event: CloseEvent) {
-        console.log(`[ttyd] websocket connection closed with code: ${event.code}`);
+    private async pollLoop() {
+        while (this.connected && this.sid) {
+            this.pollAbort = new AbortController();
+            let resp: Response;
+            try {
+                resp = await fetch(`${this.options.endpoints.poll}?sid=${encodeURIComponent(this.sid)}`, {
+                    method: 'GET',
+                    signal: this.pollAbort.signal,
+                });
+            } catch (e) {
+                if ((e as DOMException).name === 'AbortError') return;
+                console.warn('[ttyd] poll error:', e);
+                // network hiccup — brief backoff then try again
+                await new Promise(r => setTimeout(r, 1000));
+                continue;
+            }
 
-        const { refreshToken, connect, doReconnect, overlayAddon } = this;
+            if (resp.status === 204) {
+                // server held then timed out with no data; loop immediately
+                continue;
+            }
+            if (resp.status === 410 || resp.status === 404) {
+                const code = resp.status === 410 ? 1000 : 1006;
+                this.handleDisconnect(code);
+                return;
+            }
+            if (!resp.ok) {
+                console.error(`[ttyd] poll HTTP ${resp.status}`);
+                this.handleDisconnect(1006);
+                return;
+            }
+
+            const buf = await resp.arrayBuffer();
+            this.dispatchBatch(buf);
+        }
+    }
+
+    @bind
+    private dispatchBatch(buf: ArrayBuffer) {
+        const view = new DataView(buf);
+        let off = 0;
+        while (off + 4 <= buf.byteLength) {
+            const msgLen = view.getUint32(off, false);
+            off += 4;
+            if (off + msgLen > buf.byteLength) {
+                console.warn('[ttyd] truncated message in poll body');
+                return;
+            }
+            const cmd = String.fromCharCode(view.getUint8(off));
+            const payload = buf.slice(off + 1, off + msgLen);
+            off += msgLen;
+            this.handleMessage(cmd, payload);
+        }
+    }
+
+    @bind
+    private handleMessage(cmd: string, data: ArrayBuffer) {
+        switch (cmd) {
+            case Command.OUTPUT:
+                this.writeFunc(data);
+                break;
+            case Command.SET_WINDOW_TITLE:
+                this.title = this.textDecoder.decode(data);
+                document.title = this.title;
+                break;
+            case Command.SET_PREFERENCES:
+                this.applyPreferences({
+                    ...this.options.clientOptions,
+                    ...JSON.parse(this.textDecoder.decode(data)),
+                    ...this.parseOptsFromUrlQuery(window.location.search),
+                } as Preferences);
+                break;
+            default:
+                console.warn(`[ttyd] unknown command: ${cmd}`);
+                break;
+        }
+    }
+
+    @bind
+    private handleDisconnect(code: number) {
+        console.log(`[ttyd] session disconnected with code: ${code}`);
+        const wasConnected = this.connected;
+        this.connected = false;
+        this.sid = undefined;
+        this.pollAbort?.abort();
+        this.pollAbort = undefined;
+
+        if (!wasConnected && !this.opened) {
+            // never connected in the first place — surface a minimal overlay
+            this.overlayAddon.showOverlay('Connection Closed');
+            return;
+        }
+
+        const { refreshToken, connect, doReconnect, overlayAddon, terminal } = this;
         overlayAddon.showOverlay('Connection Closed');
         this.dispose();
 
-        // 1000: CLOSE_NORMAL
-        if (event.code !== 1000 && doReconnect) {
+        if (code !== 1000 && doReconnect) {
             overlayAddon.showOverlay('Reconnecting...');
             refreshToken().then(connect);
         } else if (this.closeOnDisconnect) {
             window.close();
         } else {
-            const { terminal } = this;
             const keyDispose = terminal.onKey(e => {
                 const event = e.domEvent;
                 if (event.key === 'Enter') {
@@ -337,34 +476,6 @@ export class Xterm {
         }
 
         return prefs;
-    }
-
-    @bind
-    private onSocketData(event: MessageEvent) {
-        const { textDecoder } = this;
-        const rawData = event.data as ArrayBuffer;
-        const cmd = String.fromCharCode(new Uint8Array(rawData)[0]);
-        const data = rawData.slice(1);
-
-        switch (cmd) {
-            case Command.OUTPUT:
-                this.writeFunc(data);
-                break;
-            case Command.SET_WINDOW_TITLE:
-                this.title = textDecoder.decode(data);
-                document.title = this.title;
-                break;
-            case Command.SET_PREFERENCES:
-                this.applyPreferences({
-                    ...this.options.clientOptions,
-                    ...JSON.parse(textDecoder.decode(data)),
-                    ...this.parseOptsFromUrlQuery(window.location.search),
-                } as Preferences);
-                break;
-            default:
-                console.warn(`[ttyd] unknown command: ${cmd}`);
-                break;
-        }
     }
 
     @bind

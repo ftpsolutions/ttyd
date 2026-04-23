@@ -4,23 +4,14 @@
 
 #include "pty.h"
 
-// client message
-#define INPUT '0'
-#define RESIZE_TERMINAL '1'
-#define PAUSE '2'
-#define RESUME '3'
-#define JSON_DATA '{'
-
-// server message
-#define OUTPUT '0'
-#define SET_WINDOW_TITLE '1'
-#define SET_PREFERENCES '2'
-
 // url paths
 struct endpoints {
-  char *ws;
   char *index;
   char *token;
+  char *session;
+  char *poll;
+  char *input;
+  char *close;
   char *parent;
 };
 
@@ -29,37 +20,33 @@ extern struct lws_context *context;
 extern struct server *server;
 extern struct endpoints endpoints;
 
+enum http_handler_kind {
+  HH_NONE = 0,
+  HH_STATIC,   // serve pre-built buffer then complete
+  HH_POLL,     // long-poll: body written when session has data
+  HH_INPUT,    // accept POST body, dispatch to session, respond 204
+  HH_SESSION,  // create new session from POST body, respond {"sid":...}
+  HH_CLOSE,    // destroy session, respond 204
+};
+
 struct pss_http {
   char path[128];
+  char query[256];
+
+  enum http_handler_kind kind;
+  char sid[64];
+
+  // response body staging (for HH_STATIC and once HH_SESSION completes)
   char *buffer;
   char *ptr;
   size_t len;
+  bool owns_buffer;
+
+  // accumulated POST body
+  char *body;
+  size_t body_len;
+  size_t body_cap;
 };
-
-struct pss_tty {
-  bool initialized;
-  int initial_cmd_index;
-  bool authenticated;
-  char user[30];
-  char address[50];
-  char path[128];
-  char **args;
-  int argc;
-
-  struct lws *wsi;
-  char *buffer;
-  size_t len;
-
-  pty_process *process;
-  pty_buf_t *pty_buf;
-
-  int lws_close_status;
-};
-
-typedef struct {
-  struct pss_tty *pss;
-  bool ws_closed;
-} pty_ctx_t;
 
 struct server {
   int client_count;        // client count
@@ -74,11 +61,10 @@ struct server {
   int sig_code;            // close signal
   char sig_name[20];       // human readable signal string
   bool url_arg;            // allow client to send cli arguments in URL
-  bool writable;           // whether clients to write to the TTY
-  bool check_origin;       // whether allow websocket connection from different origin
-  int max_clients;         // maximum clients to support
-  bool once;               // whether accept only one client and exit on disconnection
-  bool exit_no_conn;       // whether exit on all clients disconnection
+  bool writable;           // whether clients can write to the TTY
+  int max_clients;         // maximum concurrent sessions (0 = no limit)
+  bool once;               // accept one session, exit after it ends
+  bool exit_no_conn;       // exit when all sessions are closed
   char socket_path[255];   // UNIX domain socket path
   char terminal_type[30];  // terminal type to report
 

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "session.h"
 #include "utils.h"
 #include "compat.h"
 
@@ -21,35 +22,12 @@
 volatile bool force_exit = false;
 struct lws_context *context;
 struct server *server;
-struct endpoints endpoints = {"/ws", "/", "/token", ""};
+struct endpoints endpoints = {"/", "/token", "/session", "/poll", "/input", "/close", ""};
 
 extern int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
-extern int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
 
-// websocket protocols
 static const struct lws_protocols protocols[] = {{"http-only", callback_http, sizeof(struct pss_http), 0},
-                                                 {"tty", callback_tty, sizeof(struct pss_tty), 0},
                                                  {NULL, NULL, 0, 0}};
-
-#ifndef LWS_WITHOUT_EXTENSIONS
-// websocket extensions
-static const struct lws_extension extensions[] = {
-    {"permessage-deflate", lws_extension_callback_pm_deflate, "permessage-deflate"},
-    {"deflate-frame", lws_extension_callback_pm_deflate, "deflate_frame"},
-    {NULL, NULL, NULL}};
-#endif
-
-#if LWS_LIBRARY_VERSION_NUMBER >= 4000000
-static const uint32_t backoff_ms[] = {1000, 2000, 3000, 4000, 5000};
-static lws_retry_bo_t retry = {
-    .retry_ms_table = backoff_ms,
-    .retry_ms_table_count = LWS_ARRAY_SIZE(backoff_ms),
-    .conceal_count = LWS_ARRAY_SIZE(backoff_ms),
-    .secs_since_valid_ping = 5,
-    .secs_since_valid_hangup = 10,
-    .jitter_percent = 0,
-};
-#endif
 
 // command line options
 static const struct option options[] = {{"port", required_argument, NULL, 'p'},
@@ -63,9 +41,6 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"cwd", required_argument, NULL, 'w'},
                                         {"index", required_argument, NULL, 'I'},
                                         {"base-path", required_argument, NULL, 'b'},
-#if LWS_LIBRARY_VERSION_NUMBER >= 4000000
-                                        {"ping-interval", required_argument, NULL, 'P'},
-#endif
                                         {"srv-buf-size", required_argument, NULL, 'f'},
                                         {"ipv6", no_argument, NULL, '6'},
                                         {"ssl", no_argument, NULL, 'S'},
@@ -76,7 +51,6 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"writable", no_argument, NULL, 'W'},
                                         {"terminal-type", required_argument, NULL, 'T'},
                                         {"client-option", required_argument, NULL, 't'},
-                                        {"check-origin", no_argument, NULL, 'O'},
                                         {"max-clients", required_argument, NULL, 'm'},
                                         {"once", no_argument, NULL, 'o'},
                                         {"exit-no-conn", no_argument, NULL, 'q'},
@@ -85,7 +59,7 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"version", no_argument, NULL, 'v'},
                                         {"help", no_argument, NULL, 'h'},
                                         {NULL, 0, 0, 0}};
-static const char *opt_string = "p:i:U:c:H:u:g:s:w:I:b:P:f:6aSC:K:A:Wt:T:Om:oqBd:vh";
+static const char *opt_string = "p:i:U:c:H:u:g:s:w:I:b:f:6aSC:K:A:Wt:T:m:oqBd:vh";
 
 static void print_help() {
   // clang-format off
@@ -108,16 +82,12 @@ static void print_help() {
           "    -W, --writable          Allow clients to write to the TTY (readonly by default)\n"
           "    -t, --client-option     Send option to client (format: key=value), repeat to add more options\n"
           "    -T, --terminal-type     Terminal type to report, default: xterm-256color\n"
-          "    -O, --check-origin      Do not allow websocket connection from different origin\n"
           "    -m, --max-clients       Maximum clients to support (default: 0, no limit)\n"
           "    -o, --once              Accept only one client and exit on disconnection\n"
           "    -q, --exit-no-conn      Exit on all clients disconnection\n"
           "    -B, --browser           Open terminal with the default system browser\n"
           "    -I, --index             Custom index.html path\n"
           "    -b, --base-path         Expected base path for requests coming from a reverse proxy (eg: /mounted/here, max length: 128)\n"
-#if LWS_LIBRARY_VERSION_NUMBER >= 4000000
-          "    -P, --ping-interval     Websocket ping interval(sec) (default: 5)\n"
-#endif
           "    -f, --srv-buf-size      Maximum chunk of file (in bytes) that can be sent at once, a larger value may improve throughput (default: 4096)\n"
 #ifdef LWS_WITH_IPV6
           "    -6, --ipv6              Enable IPv6 support\n"
@@ -148,10 +118,12 @@ static void print_config() {
     lwsl_notice("  base-path: %s\n", endpoints.parent);
     lwsl_notice("  index    : %s\n", endpoints.index);
     lwsl_notice("  token    : %s\n", endpoints.token);
-    lwsl_notice("  websocket: %s\n", endpoints.ws);
+    lwsl_notice("  session  : %s\n", endpoints.session);
+    lwsl_notice("  poll     : %s\n", endpoints.poll);
+    lwsl_notice("  input    : %s\n", endpoints.input);
+    lwsl_notice("  close    : %s\n", endpoints.close);
   }
   if (server->auth_header != NULL) lwsl_notice("  auth header: %s\n", server->auth_header);
-  if (server->check_origin) lwsl_notice("  check origin: true\n");
   if (server->url_arg) lwsl_notice("  allow url arg: true\n");
   if (server->max_clients > 0) lwsl_notice("  max clients: %d\n", server->max_clients);
   if (server->once) lwsl_notice("  once: true\n");
@@ -325,9 +297,6 @@ int main(int argc, char **argv) {
   info.uid = -1;
   info.max_http_header_pool = 16;
   info.options = LWS_SERVER_OPTION_LIBUV | LWS_SERVER_OPTION_VALIDATE_UTF8 | LWS_SERVER_OPTION_DISABLE_IPV6;
-#ifndef LWS_WITHOUT_EXTENSIONS
-  info.extensions = extensions;
-#endif
   info.max_http_header_data = 65535;
 
   int debug_level = LLL_ERR | LLL_WARN | LLL_NOTICE;
@@ -363,9 +332,6 @@ int main(int argc, char **argv) {
         break;
       case 'W':
         server->writable = true;
-        break;
-      case 'O':
-        server->check_origin = true;
         break;
       case 'm':
         server->max_clients = parse_int("max-clients", optarg);
@@ -453,20 +419,9 @@ int main(int argc, char **argv) {
 #define sc(f)                                  \
   strncpy(path + len, endpoints.f, 128 - len); \
   endpoints.f = strdup(path);
-        sc(ws) sc(index) sc(token) sc(parent)
+        sc(index) sc(token) sc(session) sc(poll) sc(input) sc(close) sc(parent)
 #undef sc
       } break;
-#if LWS_LIBRARY_VERSION_NUMBER >= 4000000
-      case 'P': {
-        int interval = parse_int("ping-interval", optarg);
-        if (interval < 0) {
-          fprintf(stderr, "ttyd: invalid ping interval: %s\n", optarg);
-          return -1;
-        }
-        retry.secs_since_valid_ping = interval;
-        retry.secs_since_valid_hangup = interval + 7;
-      } break;
-#endif
       case 'f': {
         int serv_buf_size = parse_int("srv-buf-size", optarg);
         if (serv_buf_size < 0) {
@@ -537,12 +492,6 @@ int main(int argc, char **argv) {
   char server_hdr[128] = "";
   snprintf(server_hdr, sizeof(server_hdr), "ttyd/%s (libwebsockets/%s)", TTYD_VERSION, LWS_LIBRARY_VERSION);
   info.server_string = server_hdr;
-
-#if LWS_LIBRARY_VERSION_NUMBER < 4000000
-  info.ws_ping_pong_interval = 5;
-#else
-  info.retry_and_idle_policy = &retry;
-#endif
 
   if (strlen(iface) > 0) {
     info.iface = iface;
@@ -627,6 +576,7 @@ int main(int argc, char **argv) {
   }
 #undef sig_count
 
+  session_destroy_all();
   lws_context_destroy(context);
 
   // cleanup
