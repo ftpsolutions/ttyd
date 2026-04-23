@@ -102,6 +102,8 @@ export class Xterm {
     private sid?: string;
     private connected = false;
     private pollAbort?: AbortController;
+    private inputQueue: Uint8Array[] = [];
+    private inputInFlight = false;
     private token: string;
     private opened = false;
     private title?: string;
@@ -276,15 +278,59 @@ export class Xterm {
     @bind
     private sendBinary(payload: Uint8Array) {
         if (!this.sid) return;
-        // Fire-and-forget POST /input. We don't await so keystrokes pipeline.
-        fetch(`${this.options.endpoints.input}?sid=${encodeURIComponent(this.sid)}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/octet-stream' },
-            body: payload,
-            keepalive: true,
-        }).catch(err => {
-            console.warn('[ttyd] input POST failed:', err);
-        });
+        // Queue so the server sees frames in the order the terminal produced
+        // them — trzsz / zmodem break under reordering, and concurrent fetches
+        // offer no ordering guarantees.
+        this.inputQueue.push(payload);
+        if (!this.inputInFlight) void this.drainInput();
+    }
+
+    @bind
+    private async drainInput() {
+        if (this.inputInFlight || !this.sid) return;
+        this.inputInFlight = true;
+        try {
+            const INPUT_BYTE = Command.INPUT.charCodeAt(0);
+            while (this.inputQueue.length > 0 && this.sid) {
+                // Coalesce runs of INPUT frames into a single POST body.
+                // Non-INPUT frames (resize/pause/resume) each go in their own
+                // POST so their leading command byte isn't swallowed.
+                const first = this.inputQueue[0];
+                let body: Uint8Array;
+                if (first[0] === INPUT_BYTE) {
+                    const parts: Uint8Array[] = [];
+                    let total = 0;
+                    while (this.inputQueue.length > 0 && this.inputQueue[0][0] === INPUT_BYTE) {
+                        const chunk = this.inputQueue.shift()!;
+                        const slice = parts.length === 0 ? chunk : chunk.subarray(1);
+                        parts.push(slice);
+                        total += slice.length;
+                    }
+                    body = new Uint8Array(total);
+                    let off = 0;
+                    for (const p of parts) {
+                        body.set(p, off);
+                        off += p.length;
+                    }
+                } else {
+                    body = this.inputQueue.shift()!;
+                }
+                try {
+                    await fetch(`${this.options.endpoints.input}?sid=${encodeURIComponent(this.sid)}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/octet-stream' },
+                        body,
+                    });
+                } catch (err) {
+                    console.warn('[ttyd] input POST failed:', err);
+                    // Drop remaining queue; poll loop will surface the disconnect.
+                    this.inputQueue.length = 0;
+                    return;
+                }
+            }
+        } finally {
+            this.inputInFlight = false;
+        }
     }
 
     @bind
@@ -415,6 +461,7 @@ export class Xterm {
         this.sid = undefined;
         this.pollAbort?.abort();
         this.pollAbort = undefined;
+        this.inputQueue.length = 0;
 
         if (!wasConnected && !this.opened) {
             // never connected in the first place — surface a minimal overlay
