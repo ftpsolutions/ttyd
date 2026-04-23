@@ -337,7 +337,8 @@ void session_park_poll(ttyd_session *s, struct lws *wsi) {
 }
 
 void session_clear_poll(ttyd_session *s, struct lws *wsi) {
-  if (s->poll_wsi == wsi) s->poll_wsi = NULL;
+  if (s->poll_wsi != wsi) return;
+  s->poll_wsi = NULL;
   if (s->poll_timer_active) {
     uv_timer_stop(&s->poll_timer);
     s->poll_timer_active = false;

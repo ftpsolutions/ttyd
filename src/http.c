@@ -491,6 +491,7 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
       return lws_http_transaction_completed(wsi) ? -1 : 0;
 
     case LWS_CALLBACK_CLOSED_HTTP:
+      if (pss == NULL) break;
       if (pss->kind == HH_POLL && pss->sid[0] != '\0') {
         ttyd_session *s = session_find(pss->sid);
         if (s != NULL) session_clear_poll(s, wsi);
